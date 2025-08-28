@@ -41,7 +41,7 @@ fly -t main login -c http://<concourse-url> -u <user> -p <pass>
 git clone git@github.com:eminekibar/DevopsChallenge-infra.git
 ```
 
-### 2) Sır dosyasını hazırlama
+### 3) Sır dosyasını hazırlama
 
 1. `credentials.example.yml` dosyasını **gerçek değerlerle** doldur:
    - **kubeconfig_b64**: kubeconfig’inin base64 içeriği  
@@ -53,7 +53,7 @@ git clone git@github.com:eminekibar/DevopsChallenge-infra.git
 
 > `credentials.yml` **asla** commitlenmez; `.gitignore` bunu engeller.
 
-### 3) Pipeline’ları set etme
+### 4) Pipeline’ları set etme
 
 ```bash
 # Backend
@@ -72,7 +72,7 @@ fly -t main set-pipeline -p postgres \
   -l credentials.yml
 ```
 
-### 4) Pipeline’ları başlatma
+### 5) Pipeline’ları başlatma
 
 ```bash
 fly -t main unpause-pipeline -p backend
@@ -96,7 +96,7 @@ fly -t main trigger-job -j frontend/test-frontend-smoke
 fly -t main trigger-job -j postgres/deploy-db
 ```
 
-### 5) Küme Durumu (Status)
+### 6) Küme Durumu (Status)
 
 status.sh kısa bir özet verir: frontend, backend ve postgres için deployments/pods/services (varsa HPA/PVC).
 
