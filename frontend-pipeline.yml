@@ -1,0 +1,211 @@
+resource_types:
+  - name: git-safe
+    type: registry-image
+    source:
+      repository: eminekibar/git-resource-safe
+      tag: latest
+
+resources:
+  # --- GIT ---
+  - name: frontend-repo
+    type: git-safe
+    source:
+      uri: https://github.com/eminekibar/DevopsChallenge-frontend
+      branch: main
+
+jobs:
+  - name: build-frontend
+    serial_groups: ["dockerio-push"]     # push'ları seri yap
+    plan:
+      - get: frontend-repo
+        trigger: true
+
+      - task: kaniko-build-and-push-frontend
+        attempts: 2
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: gcr.io/kaniko-project/executor
+              tag: debug
+          inputs:
+            - name: frontend-repo
+          params:
+            DOCKER_USERNAME: ((docker-username))
+            DOCKER_PASSWORD: ((docker-password))
+            DOCKER_IMAGE: docker.io/eminekibar/devopschallenge-frontend
+            GODEBUG: "http2client=0"     # HTTP/2 kapalı (push hatalarını azaltır)
+          run:
+            path: /busybox/sh
+            args:
+              - -exc
+              - |
+                set -e
+
+                # Docker Hub auth
+                mkdir -p /kaniko/.docker
+                AUTH=$(printf '%s:%s' "$DOCKER_USERNAME" "$DOCKER_PASSWORD" | base64 | tr -d '\n')
+                cat > /kaniko/.docker/config.json <<EOF
+                { "auths": { "https://index.docker.io/v1/": { "auth": "$AUTH" } } }
+                EOF
+
+                # ID_TAG üretimi için daha dayanıklı snippet
+                if command -v git >/dev/null 2>&1; then
+                  ID_TAG="$(git -C frontend-repo rev-parse --short HEAD || true)"
+                fi
+                if [ -z "$ID_TAG" ] && [ -f frontend-repo/.git/HEAD ]; then
+                  ref="$(sed -n 's/^ref: //p' frontend-repo/.git/HEAD)"
+                  if [ -n "$ref" ] && [ -f "frontend-repo/.git/$ref" ]; then
+                    ID_TAG="$(cut -c1-7 "frontend-repo/.git/$ref")"
+                  fi
+                fi
+                ID_TAG="${ID_TAG:-${BUILD_ID:-manual}}"
+                echo "Using tag: ${ID_TAG}"
+
+                # Kaniko build & push (retry'li)
+                n=0
+                until [ $n -ge 3 ]; do
+                  /kaniko/executor \
+                    --context="${PWD}/frontend-repo" \
+                    --dockerfile="${PWD}/frontend-repo/Dockerfile" \
+                    --destination="${DOCKER_IMAGE}:latest" \
+                    --destination="${DOCKER_IMAGE}:${ID_TAG}" \
+                    --cache=true \
+                    --cache-repo="${DOCKER_IMAGE}-cache" \
+                    --use-new-run \
+                    --snapshot-mode=redo \
+                    --digest-file="/workspace/digest.txt" && break
+                  n=$((n+1))
+                  echo "push failed, retry $n/3 in 10s…"
+                  sleep 10
+                done
+                [ -f /workspace/digest.txt ] && echo "Pushed digest: $(cat /workspace/digest.txt)"
+  - name: deploy-frontend
+    plan:
+      - get: frontend-repo
+        trigger: true
+        passed: [build-frontend]
+
+      - task: kubectl-apply-frontend
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: bitnami/kubectl
+          inputs:
+            - name: frontend-repo
+          params:
+            HOME: /root
+            KUBECONFIG_B64: ((kubeconfig_b64))   # <-- secrets.yml'den gelecek
+          run:
+            path: /bin/sh
+            args:
+              - -exc
+              - |
+                set -e
+                mkdir -p "$HOME/.kube"
+                # kubeconfig'i base64'ten yaz
+                echo "$KUBECONFIG_B64" | base64 -d > "$HOME/.kube/config"
+
+                (apt-get update && apt-get install -y git jq) || true
+                ID_TAG="$(git -C frontend-repo rev-parse --short HEAD || echo ${BUILD_ID:-manual})"
+                # ► Build tarafı ile aynı algoritma (git yoksa da çalışır)
+                if command -v git >/dev/null 2>&1; then
+                  ID_TAG="$(git -C frontend-repo rev-parse --short HEAD || true)"
+                fi
+                if [ -z "$ID_TAG" ] && [ -f frontend-repo/.git/HEAD ]; then
+                  ref="$(sed -n 's/^ref: //p' frontend-repo/.git/HEAD)"
+                  if [ -n "$ref" ] && [ -f "frontend-repo/.git/$ref" ]; then
+                    ID_TAG="$(cut -c1-7 "frontend-repo/.git/$ref")"
+                  fi
+                fi
+                ID_TAG="${ID_TAG:-${BUILD_ID:-manual}}"
+                echo "Will deploy tag: ${ID_TAG}"
+
+                # (isteğe bağlı) doğrulama
+                kubectl config current-context
+                kubectl version
+
+                # repo köküne gir ve dosya yollarını buradan ver
+                cd frontend-repo
+                kubectl apply -f namespace.yml
+                kubectl apply -n devopschallenge -f frontend-deploy.yml
+                kubectl apply -n devopschallenge -f frontend-svc.yml
+                kubectl apply -n devopschallenge -f frontend-hpa.yml
+
+                # 3) Node cache'e takılmamak için Always çekmesini iste (varsa override eder)
+                kubectl -n devopschallenge patch deploy/frontend-deploy \
+                  --type='json' \
+                  -p='[{"op":"add","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"Always"}]' || true
+
+                # 4) Canlı objenin image'ını commit tag'ine çevir (—record ile rollout geçmişi tutulur)
+                kubectl -n devopschallenge set image deploy/frontend-deploy \
+                  app="eminekibar/devopschallenge-frontend:${ID_TAG}" --record
+                
+                # rollout bekle (Deployment adı YAML'daki metadata.name ile aynı olmalı)
+                kubectl rollout status -n devopschallenge deploy/frontend-deploy
+
+                # 6) Kanıt: çalışan podların image ve imageID (sha256 digest) bilgisi
+                echo "Running pods → name | image | imageID"
+                kubectl -n devopschallenge get pods -l app=frontend \
+                  -o jsonpath='{range .items[*]}{.metadata.name}{" | "}{.status.containerStatuses[0].image}{" | "}{.status.containerStatuses[0].imageID}{"\n"}{end}'
+  - name: test-frontend-smoke
+    plan:
+      - get: frontend-repo
+        passed: [deploy-frontend]
+        trigger: true
+
+      - task: curl-frontend
+        config:
+          platform: linux
+          image_resource:
+            type: registry-image
+            source:
+              repository: bitnami/kubectl
+          params:
+            HOME: /root
+            KUBECONFIG_B64: ((kubeconfig_b64))
+          run:
+            path: /bin/sh
+            args:
+              - -exc
+              - |
+                set -e
+                mkdir -p "$HOME/.kube"
+                echo "$KUBECONFIG_B64" | base64 -d > "$HOME/.kube/config"
+
+                ns=devopschallenge
+                name="curl-$(date +%s)"
+                img="curlimages/curl:8.11.0"
+
+                # 1) Service port (52369) — ZORUNLU TEST (fail → rollback)
+                if ! kubectl -n "$ns" run "$name" \
+                  --image="$img" --restart=Never --rm -i --command -- \
+                  sh -lc 'code=$(curl -sS -o /dev/null -w "%{http_code}" http://frontend:52369/); echo "http_code=$code"; test "$code" = 200'; then
+                  echo "❌ Frontend smoke test FAILED → rolling back..."
+                  kubectl -n "$ns" rollout undo deploy/frontend-deploy
+                  exit 1
+                fi
+
+                # 2) (Opsiyonel) Backend çağrısı ve "Hello" kontrolü
+                if ! kubectl -n "$ns" run "${name}-2" \
+                  --image="$img" --restart=Never --rm -i --command -- \
+                  sh -lc 'body=$(curl -sS "http://frontend:52369/?YourName=Emine"); echo "$body" | grep -qi "Hello"'; then
+                  echo "⚠️ Frontend->Backend entegrasyon testi başarısız"
+                  # rollback yapmak istersen buraya ekle
+                  # kubectl -n "$ns" rollout undo deploy/frontend-deploy
+                  # exit 1
+                fi
+
+                # 3) (Opsiyonel) NodePort (32369)
+                NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+                if ! kubectl -n "$ns" run "${name}-np" \
+                  --image="$img" --restart=Never --rm -i --command -- \
+                  sh -lc 'code=$(curl -sS -o /dev/null -w "%{http_code}" http://'"$NODE_IP"':32369/); echo "nodeport_http_code=$code"; test "$code" = 200'; then
+                  echo "⚠️ NodePort smoke test FAILED"
+                  # rollback yapmak istersen:
+                  # kubectl -n "$ns" rollout undo deploy/frontend-deploy
+                  # exit 1
+                fi
