@@ -13,6 +13,7 @@ DevopsChallenge-infra/
   frontend-pipeline.yml
   postgres-pipeline.yml
   credentials.example.yml  # örnek şablon credential.yml olarak değişecek.
+  status.sh
   README.md
 ```
 ---
@@ -93,4 +94,19 @@ fly -t main trigger-job -j frontend/test-frontend-smoke
 
 # Postgres
 fly -t main trigger-job -j postgres/deploy-db
+```
+
+### 5) Küme Durumu (Status)
+
+status.sh kısa bir özet verir: frontend, backend ve postgres için deployments/pods/services (varsa HPA/PVC).
+
+Kullanım:
+```bash
+chmod +x ./status.sh
+
+# Varsayılan namespace: devopschallenge
+./status.sh
+
+# Farklı namespace
+./status.sh my-namespace
 ```
