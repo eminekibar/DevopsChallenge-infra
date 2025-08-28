@@ -58,7 +58,7 @@ git clone git@github.com:eminekibar/DevopsChallenge-infra.git
 ```bash
 # Backend
 fly -t main set-pipeline -p backend \
-  -c concourse/pipelines/backend-pipeline.yml \
+  -c backend-pipeline.yml \
   -l credentials.yml
 
 # Frontend
