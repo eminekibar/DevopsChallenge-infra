@@ -38,7 +38,7 @@ fly -t <target> login -c http://<concourse-url> -u <user> -p <pass>
 ### 2) Repoyu İndirme
 
 ```bash
-git clone git@github.com:eminekibar/DevopsChallenge-infra.git
+git clone https://github.com/eminekibar/DevopsChallenge-infra.git
 ```
 
 ### 3) Sır dosyasını hazırlama
