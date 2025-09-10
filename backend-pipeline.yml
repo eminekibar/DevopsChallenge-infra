@@ -47,7 +47,10 @@ jobs:
                 { "auths": { "https://index.docker.io/v1/": { "auth": "$AUTH" } } }
                 EOF
 
-                # ID_TAG üretimi için daha dayanıklı snippet
+                # Concourse "dubious ownership" fix
+                #git config --global --add safe.directory "$PWD/backend-repo"
+
+                # ID_TAG = kısa commit SHA
                 if command -v git >/dev/null 2>&1; then
                   ID_TAG="$(git -C backend-repo rev-parse --short HEAD || true)"
                 fi
@@ -96,6 +99,9 @@ jobs:
           params:
             HOME: /root
             KUBECONFIG_B64: ((kubeconfig_b64))   # <-- secrets.yml'den gelecek
+            POSTGRES_DB: ((postgres-db))
+            POSTGRES_USERNAME: ((postgres-username))
+            POSTGRES_PASSWORD: ((postgres-password))
           run:
             path: /bin/sh
             args:
@@ -106,9 +112,11 @@ jobs:
                 # kubeconfig'i base64'ten yaz
                 echo "$KUBECONFIG_B64" | base64 -d > "$HOME/.kube/config"
                 
+                # Git & tools
                 (apt-get update && apt-get install -y git jq) || true
-                ID_TAG="$(git -C backend-repo rev-parse --short HEAD || echo ${BUILD_ID:-manual})"
-                # ► Build tarafı ile aynı algoritma (git yoksa da çalışır)
+                #git config --global --add safe.directory "$PWD/backend-repo"
+
+                # SAME TAG ALGO AS BUILD
                 if command -v git >/dev/null 2>&1; then
                   ID_TAG="$(git -C backend-repo rev-parse --short HEAD || true)"
                 fi
@@ -120,6 +128,15 @@ jobs:
                 fi
                 ID_TAG="${ID_TAG:-${BUILD_ID:-manual}}"
                 echo "Will deploy tag: ${ID_TAG}"
+
+                # backend-secret'i literal'den üret -> yaml -> apply
+                CONN="Host=postgres.devopschallenge.svc.cluster.local;Port=5432;Database=${POSTGRES_DB};Username=${POSTGRES_USERNAME};Password=${POSTGRES_PASSWORD}"
+
+                sed -e "s|__POSTGRES_USERNAME__|${POSTGRES_USERNAME}|g" \
+                    -e "s|__POSTGRES_PASSWORD__|${POSTGRES_PASSWORD}|g" \
+                    -e "s|__POSTGRES_DB__|${POSTGRES_DB}|g" \
+                    backend-repo/backend-secret.yml | kubectl -n devopschallenge apply -f -
+
                 # (isteğe bağlı) doğrulama
                 kubectl config current-context
                 kubectl version
@@ -129,7 +146,15 @@ jobs:
                 kubectl apply -n devopschallenge -f backend-deploy.yml
                 kubectl apply -n devopschallenge -f backend-svc.yml
                 kubectl apply -n devopschallenge -f backend-hpa.yml
-                
+                # Secret zaten templated olarak apply edildi (yukarıda)
+                kubectl apply -n devopschallenge -f default-deny-all.yml
+                kubectl apply -n devopschallenge -f allow-dns-egress.yml
+                kubectl apply -n devopschallenge -f allow-monitoring-scrape.yml
+                kubectl apply -n devopschallenge -f allow-frontend-to-backend.yml
+                kubectl apply -n devopschallenge -f allow-ingress-to-backend.yml
+                kubectl apply -n devopschallenge -f allow-ingress-nginx.yml
+                kubectl apply -n devopschallenge -f backend-ingress.yml
+
                 # 3) Node cache'e takılmamak için Always çekmesini iste (varsa override eder)
                 kubectl -n devopschallenge patch deploy/backend-deploy \
                   --type='json' \
@@ -144,6 +169,15 @@ jobs:
                 echo "Running pods → name | image | imageID"
                 kubectl -n devopschallenge get pods -l app=backend \
                   -o jsonpath='{range .items[*]}{.metadata.name}{" | "}{.status.containerStatuses[0].image}{" | "}{.status.containerStatuses[0].imageID}{"\n"}{end}'
+                
+                ACTUAL="$(kubectl -n devopschallenge get deploy backend-deploy \
+                  -o jsonpath='{.spec.template.spec.containers[0].image}')"
+                echo "Deployed image: $ACTUAL"
+                case "$ACTUAL" in
+                  *:${ID_TAG}) echo "✅ image tag OK (${ID_TAG})" ;;
+                  *) echo "❌ image tag mismatch"; exit 1 ;;
+                esac
+
   - name: test-backend-smoke
     plan:
       - get: backend-repo

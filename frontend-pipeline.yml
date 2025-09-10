@@ -134,6 +134,12 @@ jobs:
                 kubectl apply -n devopschallenge -f frontend-deploy.yml
                 kubectl apply -n devopschallenge -f frontend-svc.yml
                 kubectl apply -n devopschallenge -f frontend-hpa.yml
+                kubectl apply -n devopschallenge -f default-deny-all.yml
+                kubectl apply -n devopschallenge -f allow-dns-egress.yml
+                kubectl apply -n devopschallenge -f allow-ingress-nginx.yml
+                kubectl apply -n devopschallenge -f allow-monitoring-scrape.yml
+                kubectl apply -n devopschallenge -f allow-ingress-to-frontend.yml
+                kubectl apply -n devopschallenge -f frontend-ingress.yml
 
                 # 3) Node cache'e takılmamak için Always çekmesini iste (varsa override eder)
                 kubectl -n devopschallenge patch deploy/frontend-deploy \
@@ -162,8 +168,7 @@ jobs:
           platform: linux
           image_resource:
             type: registry-image
-            source:
-              repository: bitnami/kubectl
+            source: { repository: bitnami/kubectl, tag: "1.33.4" }
           params:
             HOME: /root
             KUBECONFIG_B64: ((kubeconfig_b64))
@@ -177,35 +182,75 @@ jobs:
                 echo "$KUBECONFIG_B64" | base64 -d > "$HOME/.kube/config"
 
                 ns=devopschallenge
-                name="curl-$(date +%s)"
+
+                # random suffix (RFC1123-safe)
+                rand() { (cat /proc/sys/kernel/random/uuid 2>/dev/null | cut -c1-6) || (tr -dc 'a-z0-9' </dev/urandom | head -c6); }
+                suffix="$(rand)"
+                name="curl-$(date +%s)-${suffix}"
                 img="curlimages/curl:8.11.0"
 
-                # 1) Service port (52369) — ZORUNLU TEST (fail → rollback)
-                if ! kubectl -n "$ns" run "$name" \
-                  --image="$img" --restart=Never --rm -i --command -- \
-                  sh -lc 'code=$(curl -sS -o /dev/null -w "%{http_code}" http://frontend:52369/); echo "http_code=$code"; test "$code" = 200'; then
-                  echo "❌ Frontend smoke test FAILED → rolling back..."
-                  kubectl -n "$ns" rollout undo deploy/frontend-deploy
+                # Service adını ve portunu etiketle bul (fallback: frontend / 8080)
+                SVC_NAME="$(kubectl -n "$ns" get svc -l app=frontend -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+                SVC_NAME="${SVC_NAME:-frontend}"
+                SVC_PORT="$(kubectl -n "$ns" get svc "$SVC_NAME" -o jsonpath='{.spec.ports[0].port}' 2>/dev/null || true)"
+                SVC_PORT="${SVC_PORT:-8080}"
+
+                echo "Using Service: $SVC_NAME port $SVC_PORT"
+
+                # Endpoint kontrolü: en az 1 ready address olmalı
+                EP_COUNT="$(kubectl -n "$ns" get endpoints "$SVC_NAME" -o jsonpath='{range .subsets[*]}{.addresses[*].ip}{" "}{end}' | wc -w | tr -d ' ')"
+                if [ "$EP_COUNT" = "0" ] || [ -z "$EP_COUNT" ]; then
+                  echo "❌ $SVC_NAME için hazır endpoint yok. Muhtemel sebepler:"
+                  echo "   - Service selector pod label'larıyla eşleşmiyor"
+                  echo "   - Frontend pod Ready değil (readiness probe fail)"
+                  echo "   - Container 8080 dinlemiyor"
+                  echo "Teşhis:"
+                  kubectl -n "$ns" get deploy -l app=frontend -o wide || true
+                  kubectl -n "$ns" get pods -l app=frontend -o wide || true
+                  kubectl -n "$ns" describe svc "$SVC_NAME" || true
+                  kubectl -n "$ns" get endpoints "$SVC_NAME" -o yaml || true
+                  # Rollback ve çık
+                  kubectl -n "$ns" rollout undo deploy/frontend-deploy || true
                   exit 1
                 fi
 
-                # 2) (Opsiyonel) Backend çağrısı ve "Hello" kontrolü
-                if ! kubectl -n "$ns" run "${name}-2" \
-                  --image="$img" --restart=Never --rm -i --command -- \
-                  sh -lc 'body=$(curl -sS "http://frontend:52369/?YourName=Emine"); echo "$body" | grep -qi "Hello"'; then
-                  echo "⚠️ Frontend->Backend entegrasyon testi başarısız"
-                  # rollback yapmak istersen buraya ekle
-                  # kubectl -n "$ns" rollout undo deploy/frontend-deploy
-                  # exit 1
+                # Temizlik
+                kubectl -n "$ns" delete pod "$name" --ignore-not-found --grace-period=0 --force || true
+                kubectl -n "$ns" delete pod "${name}-be" --ignore-not-found --grace-period=0 --force || true
+                kubectl -n "$ns" delete pod "${name}-np" --ignore-not-found --grace-period=0 --force || true
+
+                echo "▶ ClusterIP smoke → http://$SVC_NAME:$SVC_PORT/"
+                if ! kubectl -n "$ns" run "$name" \
+                  --image="$img" --restart=Never --rm -i \
+                  --labels="app=smoke" \
+                  --command -- sh -lc '
+                    code=$(curl -sS -o /dev/null -w "%{http_code}" http://'"$SVC_NAME"':'"$SVC_PORT"'/);
+                    echo "http_code=$code"; test "$code" = 200
+                  '; then
+                  echo "❌ Frontend ClusterIP smoke FAILED → rolling back..."
+                  kubectl -n "$ns" rollout undo deploy/frontend-deploy || true
+                  exit 1
                 fi
 
-                # 3) (Opsiyonel) NodePort (32369)
+                echo "▶ Backend health → http://backend:11130/healthz"
+                kubectl -n "$ns" run "${name}-be" \
+                  --image="$img" --restart=Never --rm -i \
+                  --labels="app=smoke" \
+                  --command -- sh -lc '
+                    code=$(curl -sS -o /dev/null -w "%{http_code}" http://backend:11130/healthz);
+                    echo "backend_http_code=$code"; test "$code" = 200
+                  ' || echo "⚠️ Backend smoke FAILED (opsiyonel)"
+
+                echo "▶ NodePort smoke (beklenen 52369)"
                 NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
-                if ! kubectl -n "$ns" run "${name}-np" \
-                  --image="$img" --restart=Never --rm -i --command -- \
-                  sh -lc 'code=$(curl -sS -o /dev/null -w "%{http_code}" http://'"$NODE_IP"':32369/); echo "nodeport_http_code=$code"; test "$code" = 200'; then
-                  echo "⚠️ NodePort smoke test FAILED"
-                  # rollback yapmak istersen:
-                  # kubectl -n "$ns" rollout undo deploy/frontend-deploy
-                  # exit 1
-                fi
+                SVC_NODEPORT=$(kubectl -n "$ns" get svc "$SVC_NAME" -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null || true)
+                NODE_PORT="${SVC_NODEPORT:-52369}"
+                echo "NODE_IP=$NODE_IP NODE_PORT=$NODE_PORT"
+
+                kubectl -n "$ns" run "${name}-np" \
+                  --image="$img" --restart=Never --rm -i \
+                  --labels="app=smoke" \
+                  --command -- sh -lc '
+                    code=$(curl -sS -o /dev/null -w "%{http_code}" http://'"$NODE_IP"':'"$NODE_PORT"'/);
+                    echo "nodeport_http_code=$code"; test "$code" = 200
+                  ' || echo "⚠️ NodePort smoke FAILED (opsiyonel)"

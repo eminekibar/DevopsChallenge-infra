@@ -21,12 +21,13 @@ jobs:
       config:
         platform: linux
         image_resource: { type: registry-image, source: { repository: bitnami/kubectl } }
-        inputs: [{ name: postgres-repo }]
+        inputs: [{ name: postgres-repo }] 
         params:
           HOME: /root
           KUBECONFIG_B64: ((kubeconfig_b64))
           POSTGRES_USERNAME: ((postgres-username))
           POSTGRES_PASSWORD: ((postgres-password))
+          POSTGRES_DB: mydb
         run:
           path: /bin/sh
           args:
@@ -36,12 +37,17 @@ jobs:
               echo "$KUBECONFIG_B64" | base64 -d > "$HOME/.kube/config"
               cd postgres-repo
               kubectl apply -f namespace.yml
-              # 1) Secret'ı env'den üret → yaml'a çevir → apply et
-              kubectl -n devopschallenge create secret generic postgres-secret \
-                --from-literal=POSTGRES_USER="${POSTGRES_USERNAME}" \
-                --from-literal=POSTGRES_PASSWORD="${POSTGRES_PASSWORD}" \
-                --dry-run=client -o yaml | kubectl apply -f -
-
+              kubectl -n devopschallenge apply -f postgres-secret.yml
+              kubectl -n devopschallenge apply -f postgres-configmap.yml
               kubectl -n devopschallenge apply -f postgres-svc.yml
               kubectl -n devopschallenge apply -f postgres-sts.yml
+              kubectl apply -n devopschallenge -f default-deny-all.yml
+              kubectl apply -n devopschallenge -f allow-dns-egress.yml
+              kubectl apply -n devopschallenge -f allow-ingress-to-postgres.yml
+              kubectl apply -n devopschallenge -f allow-monitoring-scrape.yml
+              kubectl apply -n devopschallenge -f allow-backend-to-postgres.yml
+              kubectl apply -n devopschallenge -f allow-ingress-nginx.yml
               kubectl -n devopschallenge wait --for=condition=Ready pod -l app=postgres --timeout=180s
+
+              kubectl -n devopschallenge exec postgres-0 -- sh -lc \
+              "psql -U $POSTGRES_USERNAME -d $POSTGRES_DB -v ON_ERROR_STOP=1 -c \"CREATE TABLE IF NOT EXISTS messages( id SERIAL PRIMARY KEY, name TEXT NOT NULL, text TEXT NOT NULL, created_at TIMESTAMP NOT NULL DEFAULT NOW());\""
